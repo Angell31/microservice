@@ -43,4 +43,18 @@ jobs:
         run: |
           trivy image --exit-code 1 --severity HIGH,CRITICAL adservice || true
 
-    
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2.1.8
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Configure Docker to use GCR
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev
+
+      - name: Tag Docker image
+        run: |
+          docker tag adservice us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/lgospavic-repo/adservice:v1
+
+      - name: Push Docker image to GCR
+        run: |
+          docker push us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/lgospavic-repo/adservice:v1
