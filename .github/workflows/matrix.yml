@@ -9,11 +9,11 @@ on:
       - main
 
 jobs:
+  # Job to get all folders containing Dockerfiles
   get-folders:
     runs-on: ubuntu-latest
     outputs:
       folders: ${{ steps.get_folders.outputs.folders }}
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
@@ -21,13 +21,11 @@ jobs:
       - name: Get list of folders with Dockerfiles
         id: get_folders
         run: |
-          # Find all directories containing a Dockerfile
           folders=$(find src -type f -name "Dockerfile" -exec dirname {} \;)
-
-          # Format the list as a JSON array and output it
           folder_array=$(echo "$folders" | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "::set-output name=folders::$folder_array"
 
+  # Job to install necessary tools like Docker Buildx and Trivy
   install-tools:
     runs-on: ubuntu-latest
     needs: get-folders
@@ -45,13 +43,13 @@ jobs:
           wget https://github.com/aquasecurity/trivy/releases/download/v0.59.0/trivy_0.59.0_Linux-64bit.deb
           sudo dpkg -i trivy_0.59.0_Linux-64bit.deb
 
+  # Job to scan Dockerfiles for misconfigurations (Trivy config scan)
   scan-dockerfile:
     runs-on: ubuntu-latest
     needs: install-tools
     strategy:
       matrix:
         folder: ${{ fromJson(needs.get-folders.outputs.folders) }}
-    
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
@@ -59,13 +57,13 @@ jobs:
       - name: Scan Dockerfile with Trivy (misconfig)
         run: trivy config --severity HIGH,CRITICAL ${{ matrix.folder }}/Dockerfile
 
-  build-and-scan-image:
+  # Job to build Docker images for each folder
+  build-image:
     runs-on: ubuntu-latest
     needs: scan-dockerfile
     strategy:
       matrix:
         folder: ${{ fromJson(needs.get-folders.outputs.folders) }}
-    
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
@@ -74,6 +72,17 @@ jobs:
         run: |
           docker build -t my-app-image-${{ matrix.folder }} ${{ matrix.folder }}
 
-      - name: Scan Docker image with Trivy
+  # Job to scan the built Docker image for vulnerabilities (Trivy image scan)
+  scan-image:
+    runs-on: ubuntu-latest
+    needs: build-image
+    strategy:
+      matrix:
+        folder: ${{ fromJson(needs.get-folders.outputs.folders) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Scan Docker image with Trivy (vuln scan)
         run: |
           trivy image --severity HIGH,CRITICAL my-app-image-${{ matrix.folder }}
