@@ -36,9 +36,11 @@ jobs:
       # Step 5: Build Docker image
       - name: Build Docker image
         run: |
-          docker build -t adservice .
+          docker build -t adservice ./src/adservice
 
       # Step 6: Scan the built Docker image with Trivy (Vulnerability scan)
       - name: Scan Docker image with Trivy
         run: |
           trivy image --exit-code 1 --severity HIGH,CRITICAL adservice || true
+
+    
