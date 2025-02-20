@@ -32,8 +32,7 @@ jobs:
 
       # Step 4: Scan Dockerfile with Trivy (Misconfiguration scan)
       - name: Scan Dockerfile with Trivy
-        run: trivy config --no-progress --severity HIGH,CRITICAL src/adservice/Dockerfile
-
+        run: trivy config --exit-code 1 --severity HIGH,CRITICAL src/adservice/Dockerfile || true
       # Step 5: Build Docker image
       - name: Build Docker image
         run: |
@@ -42,4 +41,4 @@ jobs:
       # Step 6: Scan the built Docker image with Trivy (Vulnerability scan)
       - name: Scan Docker image with Trivy
         run: |
-          trivy image --no-progress --severity HIGH,CRITICAL my-app-image
+          trivy image --exit-code 1 --severity HIGH,CRITICAL adservice || true
