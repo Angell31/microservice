@@ -26,9 +26,10 @@ jobs:
         run: |
           # Find all directories containing a Dockerfile
           folders=$(find src -type f -name "Dockerfile" -exec dirname {} \;)
-          
-          # Output the list of folders for use in the next job
-          echo "::set-output name=folders::$(echo $folders | tr '\n' ',')"
+
+          # Format the list as a JSON array and output it
+          folder_array=$(echo "$folders" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "::set-output name=folders::$folder_array"
 
   scan:
     needs: get-folders
