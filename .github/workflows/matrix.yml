@@ -24,10 +24,7 @@ jobs:
           # Find all directories containing Dockerfiles
           folders=$(find src -type f -name "Dockerfile" -exec dirname {} \;)
           
-          # Debugging: output the raw folders
-          echo "Found folders: $folders"
-          
-          # Format the list as a JSON array and output it
+          # Format the list as a JSON array
           folder_array=$(echo "$folders" | jq -R -s -c 'split("\n") | map(select(length > 0))')
           
           # Debugging: output the formatted JSON array
