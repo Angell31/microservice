@@ -3,10 +3,10 @@ name: Dockerfile & Image Security Scan
 on:
   push:
     branches:
-      - main  # You can change this to the branch you want
+      - main  
   pull_request:
     branches:
-      - main  # Or use this for PR-based scans
+      - main  
   workflow_dispatch:
 
 jobs:
