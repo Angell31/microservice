@@ -1,0 +1,45 @@
+name: Dockerfile & Image Security Scan
+
+on:
+  push:
+    branches:
+      - main  # You can change this to the branch you want
+  pull_request:
+    branches:
+      - main  # Or use this for PR-based scans
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Checkout the repository
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      # Step 2: Set up Docker
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3.8.0
+
+      # Step 3: Install Trivy
+      - name: Install Trivy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget
+          wget https://github.com/aquasecurity/trivy/releases/download/v0.59.0/trivy_0.59.0_Linux-64bit.deb
+          sudo dpkg -i trivy_0.59.0_Linux-64bit.deb
+
+      # Step 4: Scan Dockerfile with Trivy (Misconfiguration scan)
+      - name: Scan Dockerfile with Trivy
+        run: trivy config --no-progress --severity HIGH,CRITICAL src/adservice/Dockerfile
+
+      # Step 5: Build Docker image
+      - name: Build Docker image
+        run: |
+          docker build -t adservice .
+
+      # Step 6: Scan the built Docker image with Trivy (Vulnerability scan)
+      - name: Scan Docker image with Trivy
+        run: |
+          trivy image --no-progress --severity HIGH,CRITICAL my-app-image
