@@ -1,108 +1,83 @@
-name: Dockerfile & Image Security Scan
+name: Docker Security Scanning
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
   pull_request:
-    branches:
-      - main
+    branches: [ main ]
+  # Enable manual trigger
+  workflow_dispatch:
 
 jobs:
-  # Job to get all folders containing Dockerfiles
-  get-folders:
+  scan-and-build:
     runs-on: ubuntu-latest
-    outputs:
-      folders: ${{ steps.set_output.outputs.folders }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2
-        
-      - name: Find Dockerfiles
-        id: find_dockerfiles
-        run: |
-          # Find all directories containing Dockerfiles
-          if [ -d "src" ]; then
-            echo "Searching in src directory"
-            DOCKER_DIRS=$(find src -type f -name "Dockerfile" -exec dirname {} \; | sort -u | tr '\n' ' ')
-          else
-            echo "Searching in entire repository"
-            DOCKER_DIRS=$(find . -type f -name "Dockerfile" -not -path "*/\.*" -exec dirname {} \; | sort -u | tr '\n' ' ')
-          fi
-          
-          echo "Found Dockerfiles in: $DOCKER_DIRS"
-          echo "DOCKER_DIRS=$DOCKER_DIRS" >> $GITHUB_ENV
+        uses: actions/checkout@v3
 
-      - name: Set output properly
-        id: set_output
-        run: |
-          # Read the directories found
-          DIRS="${DOCKER_DIRS:-}"
-          
-          if [ -z "$DIRS" ]; then
-            echo "No Dockerfiles found"
-            echo "folders=[]" >> $GITHUB_OUTPUT
-          else
-            # Create a properly formatted JSON array
-            DIRS_JSON=$(echo "$DIRS" | tr ' ' '\n' | grep -v '^$' | jq -R . | jq -s .)
-            echo "Generated JSON: $DIRS_JSON"
-            echo "folders=$DIRS_JSON" >> $GITHUB_OUTPUT
-          fi
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
 
-  # Process Dockerfiles step
-  process-dockerfiles:
-    runs-on: ubuntu-latest
-    needs: get-folders
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
-        
       - name: Install Trivy
         run: |
-          sudo apt-get update
-          sudo apt-get install -y wget
-          wget https://github.com/aquasecurity/trivy/releases/download/v0.59.0/trivy_0.59.0_Linux-64bit.deb
-          sudo dpkg -i trivy_0.59.0_Linux-64bit.deb
-        
-      - name: Set up Docker
-        uses: docker/setup-buildx-action@v3.8.0
-        
-      - name: Process and scan Dockerfiles
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.37.3
+
+      - name: Find all directories with Dockerfiles
+        id: find-dockerfiles
         run: |
-          # Get the folders output
-          FOLDERS='${{ needs.get-folders.outputs.folders }}'
-          echo "Folders to process: $FOLDERS"
-          
-          # Check if folders is empty or not a valid JSON array
-          if [ "$FOLDERS" = "[]" ] || [ -z "$FOLDERS" ]; then
-            echo "No Dockerfiles found to process"
-            exit 0
-          fi
-          
-          # Process each folder
-          echo "$FOLDERS" | jq -r '.[]' | while read -r folder; do
-            echo "====== Processing $folder ======"
-            if [ ! -f "$folder/Dockerfile" ]; then
-              echo "Warning: Dockerfile not found in $folder"
-              continue
-            fi
+          echo "DOCKERFILE_DIRS=$(find . -name Dockerfile -exec dirname {} \; | jq -R -s -c 'split("\n") | map(select(length > 0))')" >> $GITHUB_ENV
+
+      - name: Display found Dockerfile directories
+        run: |
+          echo "Found Dockerfiles in the following directories:"
+          echo $DOCKERFILE_DIRS | jq -r '.[]'
+
+      - name: Scan Dockerfiles and build images
+        run: |
+          echo $DOCKERFILE_DIRS | jq -r '.[]' | while read -r dir; do
+            echo "Processing directory: $dir"
             
-            # 1. Scan Dockerfile for misconfigurations
-            echo "👉 Scanning Dockerfile for misconfigurations"
-            trivy config --severity HIGH,CRITICAL "$folder/Dockerfile" || true
+            # Extract image name from directory path
+            # Remove leading ./ and replace / with - for image naming
+            IMAGE_NAME=$(echo "$dir" | sed 's/^\.\///' | sed 's/\//-/g')
+            echo "Image name will be: $IMAGE_NAME"
             
-            # 2. Build Docker image
-            echo "👉 Building Docker image"
-            IMAGE_NAME="my-app-image-$(echo "$folder" | sed 's/[\/\.]/-/g')"
-            docker build -t "$IMAGE_NAME" "$folder" || {
-              echo "Error building Docker image for $folder"
-              continue
-            }
+            # Scan Dockerfile with Trivy
+            echo "Scanning Dockerfile in $dir"
+            trivy config --severity HIGH,CRITICAL "$dir/Dockerfile"
             
-            # 3. Scan the built image
-            echo "👉 Scanning Docker image for vulnerabilities"
-            trivy image --severity HIGH,CRITICAL "$IMAGE_NAME" || true
+            # Build Docker image
+            echo "Building Docker image from $dir/Dockerfile"
+            docker build -t "$IMAGE_NAME:latest" "$dir"
             
-            echo "====== Completed processing $folder ======"
-            echo ""
+            # Scan built Docker image with Trivy
+            echo "Scanning Docker image $IMAGE_NAME:latest"
+            trivy image --severity HIGH,CRITICAL "$IMAGE_NAME:latest"
+            
+            echo "Completed processing for $dir"
+            echo "------------------------------------------------"
           done
+
+      - name: Generate security report
+        run: |
+          echo "# Docker Security Scan Results" > security-report.md
+          echo "## Scan completed at: $(date)" >> security-report.md
+          echo "## Dockerfiles scanned:" >> security-report.md
+          
+          echo $DOCKERFILE_DIRS | jq -r '.[]' | while read -r dir; do
+            echo "- $dir" >> security-report.md
+            echo "  - Dockerfile vulnerabilities:" >> security-report.md
+            trivy config --format json --severity HIGH,CRITICAL "$dir/Dockerfile" | \
+              jq -r '.Results[] | .Vulnerabilities | length | "    - Found \(.) HIGH or CRITICAL vulnerabilities"' >> security-report.md || echo "    - Error scanning Dockerfile" >> security-report.md
+            
+            IMAGE_NAME=$(echo "$dir" | sed 's/^\.\///' | sed 's/\//-/g')
+            echo "  - Image vulnerabilities for $IMAGE_NAME:" >> security-report.md
+            trivy image --format json --severity HIGH,CRITICAL "$IMAGE_NAME:latest" | \
+              jq -r '.Results[] | .Vulnerabilities | length | "    - Found \(.) HIGH or CRITICAL vulnerabilities"' >> security-report.md || echo "    - Error scanning image" >> security-report.md
+          done
+
+      - name: Upload security report
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-report
+          path: security-report.md
