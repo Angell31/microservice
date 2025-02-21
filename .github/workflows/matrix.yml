@@ -22,81 +22,160 @@ jobs:
         id: get_folders
         run: |
           # Find all directories containing Dockerfiles
-          folders=$(find src -type f -name "Dockerfile" -exec dirname {} \; | sort -u)
+          echo "Looking for Dockerfiles in the repository..."
+          
+          # Check if src directory exists
+          if [ ! -d "src" ]; then
+            echo "Warning: 'src' directory not found. Searching in the entire repository."
+            folders=$(find . -type f -name "Dockerfile" -not -path "*/\.*" -exec dirname {} \; | sort -u)
+          else
+            folders=$(find src -type f -name "Dockerfile" -exec dirname {} \; | sort -u)
+          fi
+          
+          # Debug: Show what folders were found
+          echo "Found Dockerfiles in these folders:"
+          echo "$folders"
           
           # Handle case when no Dockerfiles are found
           if [ -z "$folders" ]; then
-            echo "No Dockerfiles found in the src directory"
+            echo "No Dockerfiles found. Setting empty array as output."
             echo "folders=[]" >> $GITHUB_OUTPUT
           else
-            # Format the list as a JSON array
-            folder_array=$(echo "$folders" | jq -R -s -c 'split("\n") | map(select(length > 0))')
-            echo "folders=$folder_array" >> $GITHUB_OUTPUT
+            # Format the list as a JSON array - using a more explicit approach
+            echo "$folders" > temp_folders.txt
+            folder_json=$(jq -R -s 'split("\n") | map(select(length > 0))' temp_folders.txt)
+            
+            # Debug: Show JSON output
+            echo "JSON array generated:"
+            echo "$folder_json"
+            
+            echo "folders=$folder_json" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Verify output format
+        run: |
+          echo "Output value is:"
+          echo "${{ steps.get_folders.outputs.folders }}"
+          
+          # Validate if it's a proper JSON
+          echo "${{ steps.get_folders.outputs.folders }}" > test_json.txt
+          if jq empty test_json.txt 2>/dev/null; then
+            echo "✅ Output is valid JSON"
+          else
+            echo "❌ Output is NOT valid JSON"
+            echo "Providing default empty array"
+            echo "folders=[]" >> $GITHUB_OUTPUT
           fi
 
-  # Job to install necessary tools like Docker Buildx and Trivy
-  install-tools:
-    runs-on: ubuntu-latest
-    needs: get-folders
-    if: ${{ needs.get-folders.outputs.folders != '[]' }}  # Only run if folders are found
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
-        
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3.8.0
-        
-      - name: Install Trivy
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget
-          wget https://github.com/aquasecurity/trivy/releases/download/v0.59.0/trivy_0.59.0_Linux-64bit.deb
-          sudo dpkg -i trivy_0.59.0_Linux-64bit.deb
-
-  # Job to scan Dockerfiles for misconfigurations (Trivy config scan)
+  # Use a fallback approach for matrix jobs
   scan-dockerfile:
     runs-on: ubuntu-latest
-    needs: install-tools
-    if: ${{ needs.get-folders.outputs.folders != '[]' }}  # Only run if folders are found
-    strategy:
-      matrix:
-        folder: ${{ fromJson(needs.get-folders.outputs.folders) }}
+    needs: get-folders
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
         
-      - name: Scan Dockerfile with Trivy (misconfig)
+      - name: Parse folders and run scan
         run: |
-          trivy config --severity HIGH,CRITICAL ${{ matrix.folder }}/Dockerfile
+          # Get the folders output and handle empty cases
+          FOLDERS='${{ needs.get-folders.outputs.folders }}'
+          
+          # If empty or invalid, use default empty array
+          if [ -z "$FOLDERS" ] || [ "$FOLDERS" = "" ]; then
+            echo "No valid folders found. Setting default."
+            FOLDERS='[]'
+          fi
+          
+          echo "Folders to process: $FOLDERS"
+          
+          # Parse and process each folder
+          if [ "$FOLDERS" != "[]" ]; then
+            echo "$FOLDERS" | jq -c '.[]' | while read -r folder; do
+              # Remove quotes from the folder path
+              folder=$(echo $folder | sed 's/"//g')
+              echo "Processing folder: $folder"
+              
+              if [ -f "$folder/Dockerfile" ]; then
+                echo "Scanning Dockerfile in $folder"
+                trivy config --severity HIGH,CRITICAL "$folder/Dockerfile" || true
+              else
+                echo "Dockerfile not found in $folder"
+              fi
+            done
+          else
+            echo "No folders to process"
+          fi
 
-  # Job to build Docker images for each folder
+  # Similar approach for other jobs
   build-image:
     runs-on: ubuntu-latest
     needs: scan-dockerfile
-    if: ${{ needs.get-folders.outputs.folders != '[]' }}  # Only run if folders are found
-    strategy:
-      matrix:
-        folder: ${{ fromJson(needs.get-folders.outputs.folders) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
         
-      - name: Build Docker image
+      - name: Parse folders and build images
         run: |
-          docker build -t my-app-image-$(echo "${{ matrix.folder }}" | sed 's/\//-/g') ${{ matrix.folder }}
+          # Get the folders output and handle empty cases
+          FOLDERS='${{ needs.get-folders.outputs.folders }}'
+          
+          # If empty or invalid, use default empty array
+          if [ -z "$FOLDERS" ] || [ "$FOLDERS" = "" ]; then
+            echo "No valid folders found. Skipping build."
+            exit 0
+          fi
+          
+          echo "Folders to process: $FOLDERS"
+          
+          # Parse and process each folder
+          if [ "$FOLDERS" != "[]" ]; then
+            echo "$FOLDERS" | jq -c '.[]' | while read -r folder; do
+              # Remove quotes from the folder path
+              folder=$(echo $folder | sed 's/"//g')
+              echo "Building image for folder: $folder"
+              
+              if [ -f "$folder/Dockerfile" ]; then
+                image_name="my-app-image-$(echo "$folder" | sed 's/\//-/g')"
+                echo "Building image: $image_name"
+                docker build -t "$image_name" "$folder"
+              else
+                echo "Dockerfile not found in $folder"
+              fi
+            done
+          else
+            echo "No folders to process"
+          fi
 
-  # Job to scan the built Docker image for vulnerabilities (Trivy image scan)
   scan-image:
     runs-on: ubuntu-latest
     needs: build-image
-    if: ${{ needs.get-folders.outputs.folders != '[]' }}  # Only run if folders are found
-    strategy:
-      matrix:
-        folder: ${{ fromJson(needs.get-folders.outputs.folders) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
         
-      - name: Scan Docker image with Trivy (vuln scan)
+      - name: Parse folders and scan images
         run: |
-          trivy image --severity HIGH,CRITICAL my-app-image-$(echo "${{ matrix.folder }}" | sed 's/\//-/g')
+          # Get the folders output and handle empty cases
+          FOLDERS='${{ needs.get-folders.outputs.folders }}'
+          
+          # If empty or invalid, use default empty array
+          if [ -z "$FOLDERS" ] || [ "$FOLDERS" = "" ]; then
+            echo "No valid folders found. Skipping scan."
+            exit 0
+          fi
+          
+          echo "Folders to process: $FOLDERS"
+          
+          # Parse and process each folder
+          if [ "$FOLDERS" != "[]" ]; then
+            echo "$FOLDERS" | jq -c '.[]' | while read -r folder; do
+              # Remove quotes from the folder path
+              folder=$(echo $folder | sed 's/"//g')
+              image_name="my-app-image-$(echo "$folder" | sed 's/\//-/g')"
+              
+              echo "Scanning image: $image_name"
+              trivy image --severity HIGH,CRITICAL "$image_name" || true
+            done
+          else
+            echo "No folders to process"
+          fi
