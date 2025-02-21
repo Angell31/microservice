@@ -9,8 +9,28 @@ on:
   workflow_dispatch:
 
 jobs:
-  scan-and-build:
+  find-dockerfiles:
     runs-on: ubuntu-latest
+    outputs:
+      dockerfile_dirs: ${{ steps.find-dirs.outputs.dockerfile_dirs }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Find Dockerfile directories
+        id: find-dirs
+        run: |
+          DIRS=$(find . -name Dockerfile -exec dirname {} \; | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "dockerfile_dirs=$DIRS" >> $GITHUB_OUTPUT
+          echo "Found Dockerfiles in: $DIRS"
+
+  scan-and-build:
+    needs: find-dockerfiles
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        directory: ${{ fromJson(needs.find-dockerfiles.outputs.dockerfile_dirs) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -22,62 +42,97 @@ jobs:
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.37.3
 
-      - name: Find all directories with Dockerfiles
-        id: find-dockerfiles
+      - name: Generate image name
+        id: image-name
         run: |
-          echo "DOCKERFILE_DIRS=$(find . -name Dockerfile -exec dirname {} \; | jq -R -s -c 'split("\n") | map(select(length > 0))')" >> $GITHUB_ENV
+          # Remove leading ./ and replace / with - for image naming
+          IMAGE_NAME=$(echo "${{ matrix.directory }}" | sed 's/^\.\///' | sed 's/\//-/g')
+          echo "name=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "Image name will be: $IMAGE_NAME"
 
-      - name: Display found Dockerfile directories
+      - name: Scan Dockerfile
+        id: scan-dockerfile
+        continue-on-error: true
         run: |
-          echo "Found Dockerfiles in the following directories:"
-          echo $DOCKERFILE_DIRS | jq -r '.[]'
+          echo "Scanning Dockerfile in ${{ matrix.directory }}"
+          mkdir -p scan-results
+          trivy config --vuln-type os,library --severity HIGH,CRITICAL --format json "${{ matrix.directory }}/Dockerfile" > scan-results/dockerfile-scan.json || true
+          VULN_COUNT=$(jq -r '.Results[] | if .Vulnerabilities then .Vulnerabilities | length else 0 end' scan-results/dockerfile-scan.json | jq -s add)
+          echo "Found $VULN_COUNT vulnerabilities in Dockerfile"
+          echo "dockerfile_vulns=$VULN_COUNT" >> $GITHUB_OUTPUT
 
-      - name: Scan Dockerfiles and build images
+      - name: Build Docker image
+        id: build-image
         run: |
-          echo $DOCKERFILE_DIRS | jq -r '.[]' | while read -r dir; do
-            echo "Processing directory: $dir"
-            
-            # Extract image name from directory path
-            # Remove leading ./ and replace / with - for image naming
-            IMAGE_NAME=$(echo "$dir" | sed 's/^\.\///' | sed 's/\//-/g')
-            echo "Image name will be: $IMAGE_NAME"
-            
-            # Scan Dockerfile with Trivy - skip misconfiguration checks
-            echo "Scanning Dockerfile in $dir"
-            trivy config --vuln-type os,library --severity HIGH,CRITICAL "$dir/Dockerfile" || echo "Dockerfile scan completed with warnings"
-            
-            # Build Docker image
-            echo "Building Docker image from $dir/Dockerfile"
-            docker build -t "$IMAGE_NAME:latest" "$dir" || { echo "Build failed for $dir"; continue; }
-            
-            # Scan built Docker image with Trivy
-            echo "Scanning Docker image $IMAGE_NAME:latest"
-            trivy image --severity HIGH,CRITICAL "$IMAGE_NAME:latest" || echo "Image scan completed with warnings"
-            
-            echo "Completed processing for $dir"
-            echo "------------------------------------------------"
-          done
+          echo "Building Docker image from ${{ matrix.directory }}/Dockerfile"
+          docker build -t "${{ steps.image-name.outputs.name }}:latest" "${{ matrix.directory }}"
 
-      - name: Generate security report
+      - name: Scan Docker image
+        id: scan-image
+        continue-on-error: true
         run: |
-          echo "# Docker Security Scan Results" > security-report.md
-          echo "## Scan completed at: $(date)" >> security-report.md
-          echo "## Dockerfiles scanned:" >> security-report.md
-          
-          echo $DOCKERFILE_DIRS | jq -r '.[]' | while read -r dir; do
-            echo "- $dir" >> security-report.md
-            echo "  - Dockerfile vulnerabilities:" >> security-report.md
-            trivy config --vuln-type os,library --format json --severity HIGH,CRITICAL "$dir/Dockerfile" | \
-              jq -r '.Results[] | if .Vulnerabilities then .Vulnerabilities | length else 0 end | "    - Found \(.) HIGH or CRITICAL vulnerabilities"' >> security-report.md || echo "    - Error scanning Dockerfile" >> security-report.md
-            
-            IMAGE_NAME=$(echo "$dir" | sed 's/^\.\///' | sed 's/\//-/g')
-            echo "  - Image vulnerabilities for $IMAGE_NAME:" >> security-report.md
-            trivy image --format json --severity HIGH,CRITICAL "$IMAGE_NAME:latest" 2>/dev/null | \
-              jq -r '.Results[] | if .Vulnerabilities then .Vulnerabilities | length else 0 end | "    - Found \(.) HIGH or CRITICAL vulnerabilities"' >> security-report.md || echo "    - Error scanning image" >> security-report.md
-          done
+          echo "Scanning Docker image ${{ steps.image-name.outputs.name }}:latest"
+          mkdir -p scan-results
+          trivy image --severity HIGH,CRITICAL --format json "${{ steps.image-name.outputs.name }}:latest" > scan-results/image-scan.json || true
+          VULN_COUNT=$(jq -r '.Results[] | if .Vulnerabilities then .Vulnerabilities | length else 0 end' scan-results/image-scan.json | jq -s add)
+          echo "Found $VULN_COUNT vulnerabilities in Docker image"
+          echo "image_vulns=$VULN_COUNT" >> $GITHUB_OUTPUT
 
-      - name: Upload security report
+      - name: Generate report for this context
+        run: |
+          mkdir -p reports
+          {
+            echo "# Security Report for ${{ matrix.directory }}"
+            echo "## Dockerfile Scan Results"
+            echo "- **Vulnerabilities found:** ${{ steps.scan-dockerfile.outputs.dockerfile_vulns || 0 }}"
+            echo
+            echo "## Docker Image Scan Results"
+            echo "- **Image name:** ${{ steps.image-name.outputs.name }}"
+            echo "- **Vulnerabilities found:** ${{ steps.scan-image.outputs.image_vulns || 0 }}"
+          } > "reports/${{ steps.image-name.outputs.name }}-report.md"
+
+      - name: Upload individual scan report
         uses: actions/upload-artifact@v4
         with:
-          name: security-report
-          path: security-report.md
+          name: ${{ steps.image-name.outputs.name }}-scan-report
+          path: reports/${{ steps.image-name.outputs.name }}-report.md
+
+      - name: Upload scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.image-name.outputs.name }}-scan-results
+          path: scan-results/
+
+  aggregate-reports:
+    needs: scan-and-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all scan reports
+        uses: actions/download-artifact@v4
+        with:
+          path: all-reports
+          pattern: '*-scan-report'
+          merge-multiple: true
+
+      - name: Combine reports
+        run: |
+          {
+            echo "# Docker Security Scan Summary Report"
+            echo "## Scan completed at: $(date)"
+            echo
+            echo "## Individual Service Reports"
+            echo
+            
+            # List all report files and include their contents
+            for report in all-reports/*-report.md; do
+              echo "---"
+              cat "$report"
+              echo
+            done
+          } > combined-security-report.md
+
+      - name: Upload combined report
+        uses: actions/upload-artifact@v4
+        with:
+          name: combined-security-report
+          path: combined-security-report.md
