@@ -1,15 +1,15 @@
-name: Docker Security Scanning
+name: Docker Security Pipeline
 
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-  # Enable manual trigger
   workflow_dispatch:
 
 jobs:
-  find-dockerfiles:
+  discover:
+    name: Discover Dockerfiles
     runs-on: ubuntu-latest
     outputs:
       dockerfile_dirs: ${{ steps.find-dirs.outputs.dockerfile_dirs }}
@@ -23,35 +23,39 @@ jobs:
           DIRS=$(find . -name Dockerfile -exec dirname {} \; | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "dockerfile_dirs=$DIRS" >> $GITHUB_OUTPUT
           echo "Found Dockerfiles in: $DIRS"
-
-  scan-and-build:
-    needs: find-dockerfiles
+  
+  scan-dockerfiles:
+    name: Scan Dockerfile
+    needs: discover
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        directory: ${{ fromJson(needs.find-dockerfiles.outputs.dockerfile_dirs) }}
+        directory: ${{ fromJson(needs.discover.outputs.dockerfile_dirs) }}
+    outputs:
+      service_name: ${{ steps.set-names.outputs.service_name }}
+      local_name: ${{ steps.set-names.outputs.local_name }}
+      vulns_found: ${{ steps.scan.outputs.dockerfile_vulns }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
 
       - name: Install Trivy
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.37.3
 
-      - name: Generate image name
-        id: image-name
+      - name: Set service names
+        id: set-names
         run: |
           # Remove leading ./ and replace / with - for image naming
-          IMAGE_NAME=$(echo "${{ matrix.directory }}" | sed 's/^\.\///' | sed 's/\//-/g')
-          echo "name=$IMAGE_NAME" >> $GITHUB_OUTPUT
-          echo "Image name will be: $IMAGE_NAME"
+          LOCAL_NAME=$(echo "${{ matrix.directory }}" | sed 's/^\.\///' | sed 's/\//-/g')
+          # Extract service name from directory path for GCP naming
+          SERVICE_NAME=$(basename "${{ matrix.directory }}")
+          echo "local_name=$LOCAL_NAME" >> $GITHUB_OUTPUT
+          echo "service_name=$SERVICE_NAME" >> $GITHUB_OUTPUT
 
       - name: Scan Dockerfile
-        id: scan-dockerfile
+        id: scan
         continue-on-error: true
         run: |
           echo "Scanning Dockerfile in ${{ matrix.directory }}"
@@ -60,77 +64,222 @@ jobs:
           VULN_COUNT=$(jq -r '.Results[] | if .Vulnerabilities then .Vulnerabilities | length else 0 end' scan-results/dockerfile-scan.json | jq -s add)
           echo "Found $VULN_COUNT vulnerabilities in Dockerfile"
           echo "dockerfile_vulns=$VULN_COUNT" >> $GITHUB_OUTPUT
+      
+      - name: Upload Dockerfile scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.set-names.outputs.local_name }}-dockerfile-scan
+          path: scan-results/dockerfile-scan.json
+
+  build-images:
+    name: Build Docker Image
+    needs: [discover, scan-dockerfiles]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        directory: ${{ fromJson(needs.discover.outputs.dockerfile_dirs) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Generate image name
+        id: image-name
+        run: |
+          # Remove leading ./ and replace / with - for image naming
+          LOCAL_NAME=$(echo "${{ matrix.directory }}" | sed 's/^\.\///' | sed 's/\//-/g')
+          echo "local_name=$LOCAL_NAME" >> $GITHUB_OUTPUT
 
       - name: Build Docker image
-        id: build-image
         run: |
           echo "Building Docker image from ${{ matrix.directory }}/Dockerfile"
-          docker build -t "${{ steps.image-name.outputs.name }}:latest" "${{ matrix.directory }}"
+          docker build -t "${{ steps.image-name.outputs.local_name }}:latest" "${{ matrix.directory }}"
+      
+      - name: Save Docker image
+        run: |
+          mkdir -p image-tars
+          docker save "${{ steps.image-name.outputs.local_name }}:latest" > "image-tars/${{ steps.image-name.outputs.local_name }}.tar"
+      
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.image-name.outputs.local_name }}-docker-image
+          path: image-tars/${{ steps.image-name.outputs.local_name }}.tar
+          retention-days: 1
+
+  scan-images:
+    name: Scan Docker Image
+    needs: [discover, build-images]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        directory: ${{ fromJson(needs.discover.outputs.dockerfile_dirs) }}
+    outputs:
+      image_vulns: ${{ steps.scan-image.outputs.image_vulns }}
+    steps:
+      - name: Generate image name
+        id: image-name
+        run: |
+          # Remove leading ./ and replace / with - for image naming
+          LOCAL_NAME=$(echo "${{ matrix.directory }}" | sed 's/^\.\///' | sed 's/\//-/g')
+          echo "local_name=$LOCAL_NAME" >> $GITHUB_OUTPUT
+
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.image-name.outputs.local_name }}-docker-image
+          path: image-tars
+
+      - name: Load Docker image
+        run: |
+          docker load < "image-tars/${{ steps.image-name.outputs.local_name }}.tar"
+          docker images
+      
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.37.3
 
       - name: Scan Docker image
         id: scan-image
         continue-on-error: true
         run: |
-          echo "Scanning Docker image ${{ steps.image-name.outputs.name }}:latest"
           mkdir -p scan-results
-          trivy image --severity HIGH,CRITICAL --format json "${{ steps.image-name.outputs.name }}:latest" > scan-results/image-scan.json || true
+          echo "Scanning Docker image ${{ steps.image-name.outputs.local_name }}:latest"
+          trivy image --severity HIGH,CRITICAL --format json "${{ steps.image-name.outputs.local_name }}:latest" > scan-results/image-scan.json || true
           VULN_COUNT=$(jq -r '.Results[] | if .Vulnerabilities then .Vulnerabilities | length else 0 end' scan-results/image-scan.json | jq -s add)
           echo "Found $VULN_COUNT vulnerabilities in Docker image"
           echo "image_vulns=$VULN_COUNT" >> $GITHUB_OUTPUT
-
-      - name: Generate report for this context
-        run: |
-          mkdir -p reports
-          {
-            echo "# Security Report for ${{ matrix.directory }}"
-            echo "## Dockerfile Scan Results"
-            echo "- **Vulnerabilities found:** ${{ steps.scan-dockerfile.outputs.dockerfile_vulns || 0 }}"
-            echo
-            echo "## Docker Image Scan Results"
-            echo "- **Image name:** ${{ steps.image-name.outputs.name }}"
-            echo "- **Vulnerabilities found:** ${{ steps.scan-image.outputs.image_vulns || 0 }}"
-          } > "reports/${{ steps.image-name.outputs.name }}-report.md"
-
-      - name: Upload individual scan report
+      
+      - name: Upload image scan results
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.image-name.outputs.name }}-scan-report
-          path: reports/${{ steps.image-name.outputs.name }}-report.md
+          name: ${{ steps.image-name.outputs.local_name }}-image-scan
+          path: scan-results/image-scan.json
 
-      - name: Upload scan results
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.image-name.outputs.name }}-scan-results
-          path: scan-results/
-
-  aggregate-reports:
-    needs: scan-and-build
+  push-to-gcp:
+    name: Push to GCP Artifact Registry
+    needs: [discover, build-images, scan-images]
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        directory: ${{ fromJson(needs.discover.outputs.dockerfile_dirs) }}
     steps:
-      - name: Download all scan reports
+      - name: Set image names
+        id: set-names
+        run: |
+          # Remove leading ./ and replace / with - for image naming
+          LOCAL_NAME=$(echo "${{ matrix.directory }}" | sed 's/^\.\///' | sed 's/\//-/g')
+          # Extract service name from directory path for GCP naming
+          SERVICE_NAME=$(basename "${{ matrix.directory }}")
+          echo "local_name=$LOCAL_NAME" >> $GITHUB_OUTPUT
+          echo "service_name=$SERVICE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Download Docker image
         uses: actions/download-artifact@v4
         with:
-          path: all-reports
-          pattern: '*-scan-report'
+          name: ${{ steps.set-names.outputs.local_name }}-docker-image
+          path: image-tars
+
+      - name: Load Docker image
+        run: |
+          docker load < "image-tars/${{ steps.set-names.outputs.local_name }}.tar"
+          docker images
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2.1.8
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Configure Docker for GCP Artifact Registry
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev
+
+      - name: Tag Docker image for GCP
+        id: tag-image
+        run: |
+          GCP_IMAGE_PATH="us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/lgospavic-repo/${{ steps.set-names.outputs.service_name }}:v1"
+          echo "Tagging image as: $GCP_IMAGE_PATH"
+          docker tag "${{ steps.set-names.outputs.local_name }}:latest" "$GCP_IMAGE_PATH"
+          echo "gcp_image_path=$GCP_IMAGE_PATH" >> $GITHUB_OUTPUT
+
+      - name: Push Docker image to GCP
+        run: |
+          echo "Pushing image to: ${{ steps.tag-image.outputs.gcp_image_path }}"
+          docker push "${{ steps.tag-image.outputs.gcp_image_path }}"
+
+  generate-reports:
+    name: Generate Security Reports
+    needs: [discover, scan-dockerfiles, scan-images, push-to-gcp]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all scan results
+        uses: actions/download-artifact@v4
+        with:
+          path: all-scans
+          pattern: '*-scan'
           merge-multiple: true
 
+      - name: Generate individual reports
+        run: |
+          mkdir -p reports
+          
+          # Process each service
+          for dockerfile_scan in all-scans/*-dockerfile-scan.json; do
+            # Extract service name from filename
+            service=$(basename "$dockerfile_scan" | sed 's/-dockerfile-scan.json//')
+            image_scan="all-scans/${service}-image-scan.json"
+            
+            # Get vulnerability counts
+            dockerfile_vulns=$(jq -r '.Results[] | if .Vulnerabilities then .Vulnerabilities | length else 0 end' "$dockerfile_scan" | jq -s 'add // 0')
+            image_vulns=$(jq -r '.Results[] | if .Vulnerabilities then .Vulnerabilities | length else 0 end' "$image_scan" | jq -s 'add // 0')
+            
+            # Generate report
+            {
+              echo "# Security Report for $service"
+              echo "## Dockerfile Scan Results"
+              echo "- **Vulnerabilities found:** $dockerfile_vulns"
+              echo
+              echo "## Docker Image Scan Results"
+              echo "- **Vulnerabilities found:** $image_vulns"
+              echo
+              echo "## Deployment Status"
+              echo "- **GCP Push Completed:** ✅"
+            } > "reports/${service}-report.md"
+          done
+      
       - name: Combine reports
         run: |
           {
-            echo "# Docker Security Scan Summary Report"
-            echo "## Scan completed at: $(date)"
+            echo "# Docker Security Pipeline Summary"
+            echo "## Completed at: $(date)"
+            echo
+            echo "## Pipeline Stages"
+            echo "1. ✅ Discovered and scanned all Dockerfiles"
+            echo "2. ✅ Built Docker images for all services"
+            echo "3. ✅ Scanned all Docker images for vulnerabilities"
+            echo "4. ✅ Pushed all images to GCP Artifact Registry"
             echo
             echo "## Individual Service Reports"
             echo
             
-            # List all report files and include their contents
-            for report in all-reports/*-report.md; do
+            # Include all individual reports
+            for report in reports/*-report.md; do
               echo "---"
               cat "$report"
               echo
             done
           } > combined-security-report.md
-
+      
+      - name: Upload individual reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: individual-security-reports
+          path: reports/*-report.md
+      
       - name: Upload combined report
         uses: actions/upload-artifact@v4
         with:
