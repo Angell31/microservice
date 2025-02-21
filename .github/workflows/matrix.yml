@@ -265,20 +265,34 @@ jobs:
             echo
             echo "## Individual Service Reports"
             echo
-            
-            # Include all individual reports
-            for report in reports/*-report.md; do
-              echo "---"
-              cat "$report"
-              echo
-            done
           } > combined-security-report.md
+          
+          # List all reports and append them to combined report
+          find reports -type f -name "*.md" | while read -r report; do
+            echo "---" >> combined-security-report.md
+            cat "$report" >> combined-security-report.md
+            echo "" >> combined-security-report.md
+          done
       
       - name: Upload individual reports
-        uses: actions/upload-artifact@v4
-        with:
-          name: individual-security-reports
-          path: reports/*-report.md
+        run: |
+          # Upload each report individually to avoid wildcard
+          find reports -type f -name "*.md" | while read -r report_file; do
+            report_name=$(basename "$report_file" .md)
+            echo "Uploading report: $report_name"
+            cp "$report_file" "./report-$report_name.md"
+            
+            # Use the GitHub API to upload the artifact
+            gh_token="${{ github.token }}"
+            run_id="${{ github.run_id }}"
+            
+            curl -X POST \
+              -H "Authorization: token $gh_token" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -F "name=security-report-$report_name" \
+              -F "file=@./report-$report_name.md" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/runs/$run_id/artifacts"
+          done
       
       - name: Upload combined report
         uses: actions/upload-artifact@v4
