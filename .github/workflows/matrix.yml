@@ -17,19 +17,22 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
-
+        
       - name: Get list of folders with Dockerfiles
         id: get_folders
         run: |
           # Find all directories containing Dockerfiles
-          folders=$(find src -type f -name "Dockerfile" -exec dirname {} \;)
+          folders=$(find src -type f -name "Dockerfile" -exec dirname {} \; | sort -u)
           
-          # Format the list as a JSON array
-          folder_array=$(echo "$folders" | jq -R -s -c 'split("\n") | map(select(length > 0))')
-
-          # Output the folder list for use in next job
-          echo "folders=$folder_array" >> $GITHUB_ENV
-          echo "::set-output name=folders::$folder_array"  # Deprecated but can be used here for compatibility.
+          # Handle case when no Dockerfiles are found
+          if [ -z "$folders" ]; then
+            echo "No Dockerfiles found in the src directory"
+            echo "folders=[]" >> $GITHUB_OUTPUT
+          else
+            # Format the list as a JSON array
+            folder_array=$(echo "$folders" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            echo "folders=$folder_array" >> $GITHUB_OUTPUT
+          fi
 
   # Job to install necessary tools like Docker Buildx and Trivy
   install-tools:
@@ -39,10 +42,10 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
-
+        
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3.8.0
-
+        
       - name: Install Trivy
         run: |
           sudo apt-get update
@@ -61,7 +64,7 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
-
+        
       - name: Scan Dockerfile with Trivy (misconfig)
         run: |
           trivy config --severity HIGH,CRITICAL ${{ matrix.folder }}/Dockerfile
@@ -77,10 +80,10 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
-
+        
       - name: Build Docker image
         run: |
-          docker build -t my-app-image-${{ matrix.folder }} ${{ matrix.folder }}
+          docker build -t my-app-image-$(echo "${{ matrix.folder }}" | sed 's/\//-/g') ${{ matrix.folder }}
 
   # Job to scan the built Docker image for vulnerabilities (Trivy image scan)
   scan-image:
@@ -93,7 +96,7 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
-
+        
       - name: Scan Docker image with Trivy (vuln scan)
         run: |
-          trivy image --severity HIGH,CRITICAL my-app-image-${{ matrix.folder }}
+          trivy image --severity HIGH,CRITICAL my-app-image-$(echo "${{ matrix.folder }}" | sed 's/\//-/g')
