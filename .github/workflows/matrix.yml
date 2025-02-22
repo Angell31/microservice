@@ -211,9 +211,106 @@ jobs:
           echo "Pushing image to: ${{ steps.tag-image.outputs.gcp_image_path }}"
           docker push "${{ steps.tag-image.outputs.gcp_image_path }}"
 
+  scan-k8s-manifests:
+    name: Scan Kubernetes Manifests
+    runs-on: ubuntu-latest
+    needs: [discover]  # Add other dependencies if needed
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.37.3
+
+      - name: Scan Kubernetes manifests
+        id: scan-k8s
+        continue-on-error: true
+        run: |
+          echo "Scanning Kubernetes manifests"
+          mkdir -p k8s-scan-results
+          
+          trivy config --severity HIGH,CRITICAL \
+            --format json \
+            --ignorefile .trivyignore \
+            --security-checks config,vuln \
+            kubernetes/kubernetes-manifests.yaml > k8s-scan-results/k8s-scan.json || true
+          
+          VULN_COUNT=$(jq -r '.Results[] | if .Vulnerabilities then .Vulnerabilities | length else 0 end' k8s-scan-results/k8s-scan.json | jq -s add)
+          MISCONFIG_COUNT=$(jq -r '.Results[] | if .Misconfigurations then .Misconfigurations | length else 0 end' k8s-scan-results/k8s-scan.json | jq -s add)
+          
+          echo "Found $VULN_COUNT vulnerabilities and $MISCONFIG_COUNT misconfigurations in Kubernetes manifests"
+          echo "k8s_vulns=$VULN_COUNT" >> $GITHUB_OUTPUT
+          echo "k8s_misconfigs=$MISCONFIG_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Upload Kubernetes scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-manifests-scan
+          path: k8s-scan-results/k8s-scan.json
+
+      - name: Check scan results
+        if: always()
+        run: |
+          VULN_COUNT=$(jq -r '.Results[] | if .Vulnerabilities then .Vulnerabilities | length else 0 end' k8s-scan-results/k8s-scan.json | jq -s add)
+          MISCONFIG_COUNT=$(jq -r '.Results[] | if .Misconfigurations then .Misconfigurations | length else 0 end' k8s-scan-results/k8s-scan.json | jq -s add)
+          
+          if [ "$VULN_COUNT" -gt 0 ] || [ "$MISCONFIG_COUNT" -gt 0 ]; then
+            echo "⚠️ Found security issues in Kubernetes manifests:"
+            echo "- Vulnerabilities: $VULN_COUNT"
+            echo "- Misconfigurations: $MISCONFIG_COUNT"
+            
+            echo "Details of findings:"
+            jq -r '.Results[] | select(.Vulnerabilities) | .Vulnerabilities[] | "Vulnerability: \(.VulnerabilityID) (\(.Severity)) - \(.Title)"' k8s-scan-results/k8s-scan.json || true
+            jq -r '.Results[] | select(.Misconfigurations) | .Misconfigurations[] | "Misconfiguration: \(.ID) (\(.Severity)) - \(.Title)"' k8s-scan-results/k8s-scan.json || true
+            
+            exit 1
+          else
+            echo "✅ No security issues found in Kubernetes manifests"
+          fi
+
+  create-cluster:
+    name: GKE Cluster Creation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2.1.8
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Create Cluster
+        id: create-cluster
+        run: |
+          if ! gcloud container clusters describe online-boutique \
+              --region=us-central1 \
+              --project=${{ secrets.GCP_PROJECT_ID }} 2>/dev/null; then
+            gcloud container clusters create-auto online-boutique \
+              --project=${{ secrets.GCP_PROJECT_ID }} \
+              --region=us-central1 \
+              --release-channel=regular \
+              --network=default \
+              --enable-master-authorized-networks \
+              --master-authorized-networks=0.0.0.0/0
+          fi
+
+      - name: Configure kubectl
+        run: |
+          gcloud container clusters get-credentials online-boutique \
+            --region=us-central1 \
+            --project=${{ secrets.GCP_PROJECT_ID }}
+
+  deployment:
+    name: GKE Creation Building 
+    needs: [discover, scan-dockerfiles, scan-images, push-to-gcp, create-cluster]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply Kubernetes Deployment
+        run: |
+          kubectl apply -f kubernetes/kubernetes-manifests.yaml  # Or the correct path to your deployment.yaml
+
   generate-reports:
     name: Generate Security Reports
-    needs: [discover, scan-dockerfiles, scan-images, push-to-gcp]
+    needs: [discover, scan-dockerfiles, scan-images, push-to-gcp, create-cluster, deployment]
     runs-on: ubuntu-latest
     steps:
       - name: Download all scan results
@@ -299,3 +396,4 @@ jobs:
         with:
           name: combined-security-report
           path: combined-security-report.md
+  
