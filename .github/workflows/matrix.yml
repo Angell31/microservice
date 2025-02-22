@@ -304,6 +304,8 @@ jobs:
     needs: [discover, scan-dockerfiles, scan-images, push-to-gcp, create-cluster]
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
       - name: List
         run: |
           ls -la
