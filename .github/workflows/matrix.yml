@@ -300,19 +300,45 @@ jobs:
             --project=${{ secrets.GCP_PROJECT_ID }}
 
   deployment:
-    name: GKE Creation Building 
+    name: Deploy to GKE
     needs: [discover, scan-dockerfiles, scan-images, push-to-gcp, create-cluster]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
-      - name: List
-        run: |
-          ls -la
-      - name: Apply Kubernetes Deployment
-        run: |
-          kubectl apply -f kubernetes/kubernetes-manifests.yaml  # Or the correct path to your deployment.yaml
 
+      - name: Install Google Cloud SDK
+        run: |
+          echo "Installing Google Cloud SDK"
+          curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo tee /etc/apt/trusted.gpg.d/google.asc
+          echo "deb [signed-by=/etc/apt/trusted.gpg.d/google.asc] https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
+          sudo apt-get update -y
+          sudo apt-get install -y google-cloud-sdk google-cloud-sdk-gke-gcloud-auth-plugin
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2.1.8
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Configure kubectl
+        run: |
+          gcloud container clusters get-credentials online-boutique \
+            --region=us-central1 \
+            --project=${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Apply Kubernetes Manifests
+        run: |
+          # Verify cluster connection
+          kubectl get nodes
+          
+          # Apply manifests with error handling
+          if kubectl apply -f kubernetes/kubernetes-manifests.yaml; then
+            echo "✅ Successfully applied Kubernetes manifests"
+          else
+            echo "❌ Failed to apply Kubernetes manifests"
+            exit 1
+          fi
+  
   generate-reports:
     name: Generate Security Reports
     needs: [discover, scan-dockerfiles, scan-images, push-to-gcp, create-cluster, deployment]
