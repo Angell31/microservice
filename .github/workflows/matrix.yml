@@ -304,6 +304,9 @@ jobs:
     needs: [discover, scan-dockerfiles, scan-images, push-to-gcp, create-cluster]
     runs-on: ubuntu-latest
     steps:
+      - name: List
+        run: |
+          ls -la
       - name: Apply Kubernetes Deployment
         run: |
           kubectl apply -f kubernetes/kubernetes-manifests.yaml  # Or the correct path to your deployment.yaml
