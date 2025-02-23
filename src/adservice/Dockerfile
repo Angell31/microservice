@@ -16,13 +16,11 @@ FROM eclipse-temurin:21.0.4_7-jre-alpine@sha256:8cc1202a100e72f6e91bf05ab274b373
 WORKDIR /app
 COPY --from=builder /app .
 
-# Create a non-root user and switch to it
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 USER appuser
 
 EXPOSE 9555
 
-# Add a HEALTHCHECK to verify container health
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 CMD curl --fail http://localhost:9555/ || exit 1
 
 ENTRYPOINT ["/app/build/install/hipstershop/bin/AdService"]
